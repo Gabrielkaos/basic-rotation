@@ -5,10 +5,12 @@
 Run by .github/workflows/rotate-db-login.yaml, one step per job, each after a
 person has approved it:
 
-- `set-password` gives the idle login, the one the switch db_login_active
-  doesn't name, the new password a person put in that login's own secret, so
-  the login works before anything switches to it. The active login is left
-  alone, so the running API notices nothing.
+- `find-idle` says which login is idle, the one the switch db_login_active
+  doesn't name, so a person can put a new password in that login's own secret
+  before approving anything.
+- `set-password` gives the idle login that new password, so the login works
+  before anything switches to it. The active login is left alone, so the
+  running API notices nothing.
 - `check-switch` makes sure a person has flipped the switch to that login, and
   that both logins still work, before anything restarts.
 - `check-connections` waits until something has connected as the new login:
@@ -67,6 +69,7 @@ SWITCH_OFF_WAIT_SECONDS = 2 * 60
 
 # Each step, and the options it needs.
 STEPS = {
+    "find-idle": [],
     "set-password": [],
     "check-switch": ["new_login"],
     "check-connections": ["new_login"],
@@ -360,6 +363,10 @@ def _run(args) -> str:
         finally:
             admin.close()
     active = read_switch()
+    if args.step == "find-idle":
+        idle = idle_login(active)
+        _hand_on("idle_login", idle)
+        return f"{SWITCH_SECRET} names {active}, so {idle} is idle and gets the new password"
     passwords = {login: read_password(login) for login in LOGINS}
     if args.step == "check-switch":
         return check_switch(active, args.new_login, passwords, _logs_in)
@@ -370,6 +377,11 @@ def _run(args) -> str:
         finally:
             admin.close()
     idle = idle_login(active)
+    if args.new_login and args.new_login != idle:
+        raise RotationRefused(
+            f"{SWITCH_SECRET} names {active} now, so {idle} is idle, not {args.new_login}: "
+            "the switch changed since this run started; start a new run"
+        )
     typed_after_switch = saved_at(f"db_login_{idle}") > saved_at(SWITCH_SECRET)
     admin = _admin()
     try:
@@ -386,7 +398,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--new-login",
         choices=LOGINS,
-        help="for the steps after set-password: the login set-password prepared",
+        help="for the steps after find-idle: the login find-idle said is idle",
     )
     parser.add_argument("--approved-by", help="who approved the run, GitHub logins separated by ';'")
     parser.add_argument("--file", help="for log: the rotation log")

@@ -1,8 +1,9 @@
 name: "Rotate database login"
 # Blue-green database password rotation, started by hand, with a person
-# approving before each step:
-#   1. give the idle login, the one the switch db_login_active doesn't name,
-#      the new password a person put in that login's own secret;
+# approving before each step. The run page first says which login is idle,
+# the one the switch db_login_active doesn't name, so that a person can put a
+# new password in that login's own secret. Then:
+#   1. give the idle login that new password;
 #   2. once a person has flipped the switch to that login, restart the API
 #      replicas one at a time so they use it;
 #   3. switch off the previous login's password, add the rotation to the log
@@ -28,32 +29,57 @@ env:
   PYTHON: ${{ vars.DEMO_DIR }}/.venv/bin/python
 
 jobs:
+  find_idle_login:
+    name: "Find the idle login"
+    runs-on: self-hosted
+    environment:
+      name: ${{ inputs.environment }}
+    outputs:
+      idle_login: ${{ steps.find.outputs.idle_login }}
+    steps:
+      - name: Check the runner can see the project
+        run: |
+          test -n "$DEMO_DIR" || { echo "Set the repository variable DEMO_DIR to the project folder on the runner's machine"; exit 1; }
+          test -x "$PYTHON" || { echo "$PYTHON is missing: create the venv in $DEMO_DIR first (see README)"; exit 1; }
+      - name: Read the switch
+        id: find
+        run: |
+          cd "$DEMO_DIR"
+          "$PYTHON" rotate/rotate_db_login.py find-idle
+      - name: Say what to do first
+        run: |
+          echo "### ${IDLE_LOGIN} is the idle login on ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Put a new password in its secret, \`python3 rotate/secrets_store.py new-password ${IDLE_LOGIN}\`, then approve the first step." >> "$GITHUB_STEP_SUMMARY"
+        env:
+          IDLE_LOGIN: ${{ steps.find.outputs.idle_login }}
+
   approve:
-    name: "Approve the rotation"
+    name: "Approve: the idle login's secret holds its new password"
+    needs: find_idle_login
     runs-on: ubuntu-latest
     environment:
       name: ${{ inputs.environment }}-gate
     steps:
-      - run: echo "Rotating the ${{ inputs.environment }} database login"
+      - run: echo "db_login_${{ needs.find_idle_login.outputs.idle_login }} holds the new password"
 
   set_new_password:
     name: "Give the idle login its new password"
-    needs: approve
+    needs: [find_idle_login, approve]
     runs-on: self-hosted
     environment:
       name: ${{ inputs.environment }}
     outputs:
       new_login: ${{ steps.set.outputs.new_login }}
     steps:
-      - name: Check the runner can see the project
-        run: |
-          test -n "$DEMO_DIR" || { echo "Set the repository variable DEMO_DIR to the project folder on the runner's machine"; exit 1; }
-          test -x "$PYTHON" || { echo "$PYTHON is missing: create the venv in $DEMO_DIR first (see README)"; exit 1; }
       - name: Set the new password
         id: set
+        # --new-login makes the step refuse if the switch changed since the
+        # run started, instead of setting the other login's password.
         run: |
           cd "$DEMO_DIR"
-          "$PYTHON" rotate/rotate_db_login.py set-password
+          "$PYTHON" rotate/rotate_db_login.py set-password --new-login "$IDLE_LOGIN"
+        env:
+          IDLE_LOGIN: ${{ needs.find_idle_login.outputs.idle_login }}
       - name: Say what to do next
         run: |
           echo "### ${NEW_LOGIN} is ready on ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"

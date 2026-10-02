@@ -18,7 +18,7 @@ Both logins work until step 3, so there is never a moment where the API can't lo
 
 | Path | What it is |
 |---|---|
-| `.github/workflows/rotate-db-login.yaml` | The workflow: three approval gates, three jobs |
+| `.github/workflows/rotate-db-login.yaml` | The workflow: a job that names the idle login, then three approval gates and three jobs |
 | `.github/workflows/check-rotation-log.yaml` | Checks the log on the pull request the workflow opens |
 | `rotate/rotate_db_login.py` | The rotation steps, one per job, each refusing when it would be unsafe |
 | `rotate/secrets_store.py` | The secrets store: three JSON files a person edits by hand |
@@ -61,6 +61,7 @@ The same steps the workflow runs, so you can watch each one refuse or succeed:
 
 ```bash
 PY=.venv/bin/python
+$PY rotate/rotate_db_login.py find-idle                             # the switch names blue, so green is idle
 $PY rotate/rotate_db_login.py set-password                          # refused: green's password predates the switch
 python3 rotate/secrets_store.py new-password app_green              # the person's job
 $PY rotate/rotate_db_login.py set-password                          # green has its new password; blue is untouched
@@ -141,14 +142,14 @@ Don't install it as a service. `./run.sh` in a terminal is enough, and `./config
 
 Three terminals: the runner's `./run.sh`, `python3 rotate/load.py`, and one for the commands below. A browser on the repository's **Actions** tab.
 
-1. `python3 rotate/secrets_store.py show` says which login the switch names; the other one is idle. Put a new password in the idle one, the person's first job: `python3 rotate/secrets_store.py new-password app_green` the first time. The steps below say `app_green`; read `app_blue` when blue is the idle one.
-2. **Actions → Rotate database login → Run workflow**, environment `demo`.
-3. **Approve "Approve the rotation".** The runner gives green its new password. The run page then says green is ready and asks for the switch.
+1. **Actions → Rotate database login → Run workflow**, environment `demo`. The first job runs on your machine and the run page says which login is idle, green the first time, and the command to give it a new password.
+2. Run that command, `python3 rotate/secrets_store.py new-password app_green`, then **approve "the idle login's secret holds its new password"**. The steps below say `app_green`; read `app_blue` when blue is the idle one.
+3. The runner gives green its new password. The run page then says green is ready and asks for the switch.
 4. `python3 rotate/secrets_store.py switch app_green`, then **approve "db_login_active now names the new login"**. The runner checks the switch, restarts `api_1` and then `api_2`, and waits until something connects as green. Watch `load.py`: the login flips, the error count stays at 0.
 5. **Approve "switch off the previous login's password"**. The runner makes sure nothing has used blue for 30 seconds, which is at once if the old replicas are gone, switches its password off, closes any leftover connections, appends the rotation to `rotations/demo.csv` in a new pull request, and says "Rotation complete" on the run page.
 6. Merge the pull request. The log's check runs on main after the merge, and on the pull request itself if `LOG_PR_TOKEN` is set, see below.
 
-To show a refusal: skip step 1. The first job fails with `db login rotation: refused: … put a new one in it first`. Do step 1, then **Re-run failed jobs**.
+To show a refusal: approve the first gate without running the command. The password job fails with `db login rotation: refused: … put a new one in it first`. Run the command, then **Re-run failed jobs**.
 
 To show something still using the old login: before step 5, open `psql` as `app_blue` in a fourth terminal and run `select pg_sleep(60)`. The last job waits until it is done, then carries on.
 
