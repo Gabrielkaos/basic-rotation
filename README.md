@@ -112,6 +112,19 @@ gh api -X PUT "repos/$OWNER/basic-rotation/environments/demo-gate" --input - <<E
 EOF
 ```
 
+### On the Free plan: make the repository public
+
+Step 2 then fails with "ensure the billing plan supports the required reviewers protection rule". Two ways out: GitHub Pro for a month keeps the repository private, or the repository becomes public. Nothing in it is secret, so public is fine, but GitHub's own advice is to almost never put a self-hosted runner on a public repository, because a pull request from a fork can carry code. So, if you go public, also:
+
+```bash
+gh repo edit "$OWNER/basic-rotation" --visibility public --accept-visibility-change-consequences
+# now repeat step 2, which succeeds
+# workflow runs from forks need your approval before they run
+gh api -X PUT "repos/$OWNER/basic-rotation/actions/permissions/fork-pr-contributor-approval" -f approval_policy=all_external_contributors
+```
+
+Keep the runner registered only while you rehearse or demo, remove it right after, and never approve a workflow run from a fork. The check workflow already runs on GitHub's machines, never on yours.
+
 ### The runner
 
 The jobs that touch the database and docker run on your machine, as a self-hosted runner. GitHub shows the exact commands under **Settings → Actions → Runners → New self-hosted runner → Linux**: a download, then a configure step with a token from that page. Press Enter at every question, then start it:
@@ -120,13 +133,13 @@ The jobs that touch the database and docker run on your machine, as a self-hoste
 ./run.sh      # leave it running while you demo
 ```
 
-Don't install it as a service. `./run.sh` in a terminal is enough, and `./config.sh remove` unregisters it afterwards. Never register it on a public repository: anyone could then run code on your machine through a pull request.
+Don't install it as a service. `./run.sh` in a terminal is enough, and `./config.sh remove` unregisters it afterwards. On a public repository, register it only for the time you need it, see above.
 
 ## The rotation, with the buttons
 
 Three terminals: the runner's `./run.sh`, `python3 rotate/load.py`, and one for the commands below. A browser on the repository's **Actions** tab.
 
-1. `python3 rotate/secrets_store.py new-password app_green`, the person's first job.
+1. `python3 rotate/secrets_store.py show` says which login the switch names; the other one is idle. Put a new password in the idle one, the person's first job: `python3 rotate/secrets_store.py new-password app_green` the first time. The steps below say `app_green`; read `app_blue` when blue is the idle one.
 2. **Actions → Rotate database login → Run workflow**, environment `demo`.
 3. **Approve "Approve the rotation".** The runner gives green its new password. The run page then says green is ready and asks for the switch.
 4. `python3 rotate/secrets_store.py switch app_green`, then **approve "db_login_active now names the new login"**. The runner checks the switch, restarts `api_1` and then `api_2`, and waits until something connects as green. Watch `load.py`: the login flips, the error count stays at 0.
