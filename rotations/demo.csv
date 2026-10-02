@@ -1,3 +1,4 @@
 date,active_user_before_rotation,active_user_after_rotation,actor,approved_by,run_url
 2026-10-02,blue,green,gabriel,you,local
 2026-10-02,green,blue,Gabrielkaos,Gabrielkaos,https://github.com/Gabrielkaos/basic-rotation/actions/runs/36958562271
+2026-10-02,blue,green,Gabrielkaos,Gabrielkaos,https://github.com/Gabrielkaos/basic-rotation/actions/runs/36960061613
