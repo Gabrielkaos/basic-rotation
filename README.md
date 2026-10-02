@@ -133,6 +133,8 @@ The jobs that touch the database and docker run on your machine, as a self-hoste
 ./run.sh      # leave it running while you demo
 ```
 
+The jobs run docker, so start it from a terminal where `docker ps` works. If you were added to the docker group in this login session, that terminal doesn't have the group yet: either log out and in, or start the runner with `sg docker -c ./run.sh`. Otherwise the restart step fails with "permission denied while trying to connect to the docker API".
+
 Don't install it as a service. `./run.sh` in a terminal is enough, and `./config.sh remove` unregisters it afterwards. On a public repository, register it only for the time you need it, see above.
 
 ## The rotation, with the buttons
