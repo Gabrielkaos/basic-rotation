@@ -154,7 +154,7 @@ Optional, so that the log's check also runs on the pull request the workflow ope
 
 ## When a step refuses
 
-It prints `db login rotation: refused:` and the reason, changes nothing unsafe, and the job fails. Fix the reason, then use **Re-run failed jobs** on the run page. If the log's pull request couldn't be opened, the rotation itself is done; add the row by hand in a pull request.
+It prints `db login rotation: refused:` and the reason, changes nothing unsafe, and the job fails. Fix the reason, then use **Re-run failed jobs** on the run page, never **Re-run all jobs**: that one starts the rotation over, works out the idle login from the switch again, and if you have already flipped the switch it tries a rotation in the other direction and refuses, saying the other login's password predates the switch. If that has happened: flip the switch back to the login the API is still using, give the idle login a fresh password, and start a new run. If the log's pull request couldn't be opened, the rotation itself is done; add the row by hand in a pull request.
 
 ## Clean up
 
