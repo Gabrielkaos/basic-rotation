@@ -1,0 +1,160 @@
+name: "Rotate database login"
+# Blue-green database password rotation, started by hand, with a person
+# approving before each step:
+#   1. give the idle login, the one the switch db_login_active doesn't name,
+#      the new password a person put in that login's own secret;
+#   2. once a person has flipped the switch to that login, restart the API
+#      replicas one at a time so they use it;
+#   3. switch off the previous login's password, add the rotation to the log
+#      in a pull request, and say the rotation is complete.
+# The approval jobs run on GitHub. The other jobs run on a self-hosted runner
+# on the machine where docker compose runs, in the folder the repository
+# variable DEMO_DIR names. README.md walks through a run.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment whose database login to rotate"
+        type: choice
+        options:
+          - demo
+
+permissions:
+  contents: read
+
+env:
+  DEMO_DIR: ${{ vars.DEMO_DIR }}
+  SECRETS_DIR: ${{ vars.DEMO_DIR }}/secrets
+  PYTHON: ${{ vars.DEMO_DIR }}/.venv/bin/python
+
+jobs:
+  approve:
+    name: "Approve the rotation"
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}-gate
+    steps:
+      - run: echo "Rotating the ${{ inputs.environment }} database login"
+
+  set_new_password:
+    name: "Give the idle login its new password"
+    needs: approve
+    runs-on: self-hosted
+    environment:
+      name: ${{ inputs.environment }}
+    outputs:
+      new_login: ${{ steps.set.outputs.new_login }}
+    steps:
+      - name: Check the runner can see the project
+        run: |
+          test -n "$DEMO_DIR" || { echo "Set the repository variable DEMO_DIR to the project folder on the runner's machine"; exit 1; }
+          test -x "$PYTHON" || { echo "$PYTHON is missing: create the venv in $DEMO_DIR first (see README)"; exit 1; }
+      - name: Set the new password
+        id: set
+        run: |
+          cd "$DEMO_DIR"
+          "$PYTHON" rotate/rotate_db_login.py set-password
+      - name: Say what to do next
+        run: |
+          echo "### ${NEW_LOGIN} is ready on ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Flip the switch to it, \`python3 rotate/secrets_store.py switch ${NEW_LOGIN}\`, then approve the next step." >> "$GITHUB_STEP_SUMMARY"
+        env:
+          NEW_LOGIN: ${{ steps.set.outputs.new_login }}
+
+  approve_switch:
+    name: "Approve: db_login_active now names the new login"
+    needs: set_new_password
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}-gate
+    steps:
+      - run: echo "db_login_active flipped to ${{ needs.set_new_password.outputs.new_login }}"
+
+  switch_over:
+    name: "Move the API to the new login"
+    needs: [set_new_password, approve_switch]
+    runs-on: self-hosted
+    environment:
+      name: ${{ inputs.environment }}
+    env:
+      NEW_LOGIN: ${{ needs.set_new_password.outputs.new_login }}
+    steps:
+      - name: Check the switch names the new login
+        run: |
+          cd "$DEMO_DIR"
+          "$PYTHON" rotate/rotate_db_login.py check-switch --new-login "$NEW_LOGIN"
+      - name: Restart the API replicas one at a time
+        # --wait returns once the recreated replica answers /health, so the
+        # second one is only restarted when the first is back.
+        run: |
+          cd "$DEMO_DIR"
+          for REPLICA in api_1 api_2; do
+            docker compose up -d --force-recreate --no-deps --wait "$REPLICA"
+          done
+      - name: Check something connects as the new login
+        run: |
+          cd "$DEMO_DIR"
+          "$PYTHON" rotate/rotate_db_login.py check-connections --new-login "$NEW_LOGIN"
+      - name: Say what to do next
+        run: |
+          echo "### Everything on ${{ inputs.environment }} now uses ${NEW_LOGIN}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Approve the last step to switch off the previous login's password. It first waits until that login has been unused for a while." >> "$GITHUB_STEP_SUMMARY"
+
+  approve_switch_off:
+    name: "Approve: switch off the previous login's password"
+    needs: [set_new_password, switch_over]
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}-gate
+    steps:
+      - run: echo "Switching off the password of the login before ${{ needs.set_new_password.outputs.new_login }}"
+
+  switch_off:
+    name: "Switch off the previous login and log the rotation"
+    needs: [set_new_password, approve_switch_off]
+    runs-on: self-hosted
+    environment:
+      name: ${{ inputs.environment }}
+    permissions:
+      contents: write # push the log's branch
+      pull-requests: write # open the log's pull request
+      actions: read # the run's approvals, for the log
+    env:
+      NEW_LOGIN: ${{ needs.set_new_password.outputs.new_login }}
+      LOG: rotations/${{ inputs.environment }}.csv
+      # A pull request opened with the built-in token doesn't start other
+      # workflows, so the log's check only runs on it if LOG_PR_TOKEN, a
+      # fine-grained token of a person, is set. Without it, the check runs
+      # on main once the pull request is merged.
+      GH_TOKEN: ${{ secrets.LOG_PR_TOKEN || github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Switch off the previous login's password
+        run: |
+          cd "$DEMO_DIR"
+          "$PYTHON" rotate/rotate_db_login.py switch-off --new-login "$NEW_LOGIN"
+      - name: Add the rotation to the log, in a pull request
+        id: log
+        # Only people count as approvers: an environment's wait timer shows up
+        # as an approval by github-actions[bot].
+        run: |
+          APPROVED_BY=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" --jq '[.[] | select(.state == "approved" and .user.type == "User") | .user.login] | unique | join(";")')
+          "$PYTHON" rotate/rotate_db_login.py log --new-login "$NEW_LOGIN" --approved-by "$APPROVED_BY" --file "$LOG"
+          BRANCH="db-login-rotation/${{ inputs.environment }}-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          TITLE="Log the ${{ inputs.environment }} database login rotation"
+          git switch -c "$BRANCH"
+          git add "$LOG"
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "$TITLE"
+          git push origin "$BRANCH"
+          PR=$(gh pr create --base "$GITHUB_REF_NAME" --head "$BRANCH" --title "$TITLE" --body "Added by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID, approved by $APPROVED_BY.")
+          echo "approved_by=$APPROVED_BY" >> "$GITHUB_OUTPUT"
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+      - name: Say the rotation is complete
+        run: |
+          echo "### Rotation complete on ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${NEW_LOGIN} is the active login, and the previous login's password is switched off. Approved by ${APPROVED_BY}." >> "$GITHUB_STEP_SUMMARY"
+          echo "Merge the log's pull request to keep the record: ${LOG_PR}" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          APPROVED_BY: ${{ steps.log.outputs.approved_by }}
+          LOG_PR: ${{ steps.log.outputs.pr }}

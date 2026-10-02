@@ -1,0 +1,4 @@
+# The secrets store: passwords and the switch live here, never in git.
+secrets/
+.venv/
+__pycache__/

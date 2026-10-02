@@ -1,0 +1,65 @@
+# Blue-green database password rotation demo: one database with two logins,
+# two copies of a small API behind a load balancer, and nothing else.
+#
+#   docker compose up -d --build --wait      # start everything
+#   curl -s http://127.0.0.1:8080/whoami     # which replica answered, as which login
+#
+# The rotation workflow restarts api_1 and api_2 one at a time; the load
+# balancer sends requests to the other one meanwhile, so nothing fails.
+services:
+  database:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: admin-not-secret
+      POSTGRES_DB: demo
+    ports:
+      - "127.0.0.1:5499:5432"
+    volumes:
+      - database:/var/lib/postgresql/data
+      - ./db:/db:ro
+      - ./secrets:/secrets:ro
+      # Runs once, when the volume is first created: see db/init.sh.
+      - ./db/init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d demo"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  api_1: &api
+    build: ./app
+    environment:
+      REPLICA: api_1
+      DATABASE_HOST: database
+      SECRETS_DIR: /secrets
+    volumes:
+      - ./secrets:/secrets:ro
+    depends_on:
+      database:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+
+  api_2:
+    <<: *api
+    environment:
+      REPLICA: api_2
+      DATABASE_HOST: database
+      SECRETS_DIR: /secrets
+
+  web:
+    image: caddy:2-alpine
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - api_1
+      - api_2
+
+volumes:
+  database:

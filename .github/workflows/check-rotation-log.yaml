@@ -1,0 +1,41 @@
+name: "Check rotation log"
+# Rows of rotations/demo.csv may only be appended. This runs on the pull
+# request the rotation workflow opens, and on anything else that touches the
+# log. It never uses the self-hosted runner: a pull request can come from
+# anyone, so its code only runs on GitHub's own machines.
+on:
+  pull_request:
+    paths:
+      - rotations/**
+      - rotate/rotation_log.py
+      - .github/workflows/check-rotation-log.yaml
+  push:
+    branches:
+      - main
+    paths:
+      - rotations/**
+      - rotate/rotation_log.py
+      - .github/workflows/check-rotation-log.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Check the log against its rules and its base commit
+        # The base is the pull request's base, or the previous main on a push.
+        # Without one (the first push to main), the log is checked on its own.
+        run: |
+          FILE=rotations/demo.csv
+          BASE_SHA="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ] \
+             && git fetch --quiet --depth=1 origin "$BASE_SHA" && git cat-file -e "$BASE_SHA:$FILE" 2>/dev/null; then
+            git show "$BASE_SHA:$FILE" > "$RUNNER_TEMP/previous.csv"
+            python3 rotate/rotation_log.py check "$FILE" --previous "$RUNNER_TEMP/previous.csv"
+          else
+            python3 rotate/rotation_log.py check "$FILE"
+          fi
