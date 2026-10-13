@@ -1,13 +1,14 @@
 name: "Rotate database login"
 # Blue-green database password rotation, started by hand, with a person
-# approving before each step. The run page first says which login is idle,
-# the one the switch db_login_active doesn't name, so that a person can put a
-# new password in that login's own secret. Then:
+# approving before each step. Before starting, a person reads which login the
+# switch database_user_active in api_secrets names, and puts a new password in
+# the other, idle, login's slot. Then:
 #   1. give the idle login that new password;
 #   2. once a person has flipped the switch to that login, restart the API
 #      replicas one at a time so they use it;
-#   3. switch off the previous login's password, add the rotation to the log
-#      in a pull request, and say the rotation is complete.
+#   3. once a person has emptied the previous login's slot, switch off that
+#      login's password, add the rotation to the log in a pull request, and
+#      say the rotation is complete.
 # The approval jobs run on GitHub. The other jobs run on a self-hosted runner
 # on the machine where docker compose runs, in the folder the repository
 # variable DEMO_DIR names. README.md walks through a run.
@@ -29,72 +30,47 @@ env:
   PYTHON: ${{ vars.DEMO_DIR }}/.venv/bin/python
 
 jobs:
-  find_idle_login:
-    name: "Find the idle login"
-    runs-on: self-hosted
-    environment:
-      name: ${{ inputs.environment }}
-    outputs:
-      idle_login: ${{ steps.find.outputs.idle_login }}
-    steps:
-      - name: Check the runner can see the project
-        run: |
-          test -n "$DEMO_DIR" || { echo "Set the repository variable DEMO_DIR to the project folder on the runner's machine"; exit 1; }
-          test -x "$PYTHON" || { echo "$PYTHON is missing: create the venv in $DEMO_DIR first (see README)"; exit 1; }
-      - name: Read the switch
-        id: find
-        run: |
-          cd "$DEMO_DIR"
-          "$PYTHON" rotate/rotate_db_login.py find-idle
-      - name: Say what to do first
-        run: |
-          echo "### ${IDLE_LOGIN} is the idle login on ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Put a new password in its secret, \`python3 rotate/secrets_store.py new-password ${IDLE_LOGIN}\`, then approve the first step." >> "$GITHUB_STEP_SUMMARY"
-        env:
-          IDLE_LOGIN: ${{ steps.find.outputs.idle_login }}
-
   approve:
-    name: "Approve: the idle login's secret holds its new password"
-    needs: find_idle_login
+    name: "Approve the rotation"
     runs-on: ubuntu-latest
     environment:
       name: ${{ inputs.environment }}-gate
     steps:
-      - run: echo "db_login_${{ needs.find_idle_login.outputs.idle_login }} holds the new password"
+      - run: echo "Rotating the ${{ inputs.environment }} database login"
 
   set_new_password:
     name: "Give the idle login its new password"
-    needs: [find_idle_login, approve]
+    needs: approve
     runs-on: self-hosted
     environment:
       name: ${{ inputs.environment }}
     outputs:
       new_login: ${{ steps.set.outputs.new_login }}
     steps:
+      - name: Check the runner can see the project
+        run: |
+          test -n "$DEMO_DIR" || { echo "Set the repository variable DEMO_DIR to the project folder on the runner's machine"; exit 1; }
+          test -x "$PYTHON" || { echo "$PYTHON is missing: create the venv in $DEMO_DIR first (see README)"; exit 1; }
       - name: Set the new password
         id: set
-        # --new-login makes the step refuse if the switch changed since the
-        # run started, instead of setting the other login's password.
         run: |
           cd "$DEMO_DIR"
-          "$PYTHON" rotate/rotate_db_login.py set-password --new-login "$IDLE_LOGIN"
-        env:
-          IDLE_LOGIN: ${{ needs.find_idle_login.outputs.idle_login }}
+          "$PYTHON" rotate/rotate_db_login.py set-password
       - name: Say what to do next
         run: |
           echo "### ${NEW_LOGIN} is ready on ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Flip the switch to it, \`python3 rotate/secrets_store.py switch ${NEW_LOGIN}\`, then approve the next step." >> "$GITHUB_STEP_SUMMARY"
+          echo "Set database_user_active in api_secrets to ${NEW_LOGIN}, \`python3 rotate/secrets_store.py switch ${NEW_LOGIN}\`, then approve the next step." >> "$GITHUB_STEP_SUMMARY"
         env:
           NEW_LOGIN: ${{ steps.set.outputs.new_login }}
 
   approve_switch:
-    name: "Approve: db_login_active now names the new login"
+    name: "Approve: database_user_active now names the new login"
     needs: set_new_password
     runs-on: ubuntu-latest
     environment:
       name: ${{ inputs.environment }}-gate
     steps:
-      - run: echo "db_login_active flipped to ${{ needs.set_new_password.outputs.new_login }}"
+      - run: echo "database_user_active flipped to ${{ needs.set_new_password.outputs.new_login }}"
 
   switch_over:
     name: "Move the API to the new login"
@@ -117,14 +93,15 @@ jobs:
           for REPLICA in api_1 api_2; do
             docker compose up -d --force-recreate --no-deps --wait "$REPLICA"
           done
-      - name: Check something connects as the new login
+      - name: Check the API connects as the new login
         run: |
           cd "$DEMO_DIR"
           "$PYTHON" rotate/rotate_db_login.py check-connections --new-login "$NEW_LOGIN"
       - name: Say what to do next
         run: |
-          echo "### Everything on ${{ inputs.environment }} now uses ${NEW_LOGIN}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Approve the last step to switch off the previous login's password. It first waits until that login has been unused for a while." >> "$GITHUB_STEP_SUMMARY"
+          PREVIOUS=$([ "$NEW_LOGIN" = app_blue ] && echo app_green || echo app_blue)
+          echo "### The ${{ inputs.environment }} API now uses ${NEW_LOGIN}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Empty ${PREVIOUS}'s slot, \`python3 rotate/secrets_store.py empty ${PREVIOUS}\`, then approve the last step to switch off its password. Until then you can still go back: flip the switch back and restart." >> "$GITHUB_STEP_SUMMARY"
 
   approve_switch_off:
     name: "Approve: switch off the previous login's password"

@@ -6,22 +6,24 @@ Everything runs on your own machine with docker compose. Only the buttons are Gi
 
 ## The idea
 
-The database has two logins with the same rights, `app_blue` and `app_green`. A switch, the secret `db_login_active`, names the one the API uses; the other one is idle. A rotation:
+The database has two logins with the same rights, `app_blue` and `app_green`. One secret, `api_secrets`, holds a switch, `database_user_active`, naming the login the API uses, and a password slot for each login, `app_blue_password` and `app_green_password`. The login the switch doesn't name is idle. A rotation:
 
-1. **Give the idle login a new password.** A person saves a new password in that login's secret; the workflow sets it in the database. The active login is untouched, so the running API notices nothing.
+1. **Give the idle login a new password.** A person puts a new password in the idle login's slot; the workflow sets it in the database. The active login is untouched, so the running API notices nothing.
 2. **Move the API over.** A person flips the switch; the workflow restarts the API replicas one at a time. Each restarted replica reads the switch and connects as the new login, while the other replica still answers.
-3. **Switch off the previous login's password**, once nothing uses it any more. The rotation is then logged in a pull request, and the run page says "Rotation complete".
+3. **Switch off the previous login's password.** A person empties that login's slot; the workflow waits until nothing is connected as it, then switches its password off. The rotation is logged in a pull request, and the run page says "Rotation complete".
 
-Both logins work until step 3, so there is never a moment where the API can't log in. Next time the roles swap: the idle login is the one that was active before.
+Both logins work until step 3, so there is never a moment where the API can't log in, and until then you can still go back by flipping the switch back and restarting. Next time the roles swap: the idle login is the one that was active before.
+
+Emptying the slot in step 3 is what keeps an old password from coming back: the next rotation refuses an empty slot, and refuses a password the login already has, so someone has to put a fresh one in.
 
 ## What's in the repo
 
 | Path | What it is |
 |---|---|
-| `.github/workflows/rotate-db-login.yaml` | The workflow: a job that names the idle login, then three approval gates and three jobs |
+| `.github/workflows/rotate-db-login.yaml` | The workflow: three approval gates, each followed by a job |
 | `.github/workflows/check-rotation-log.yaml` | Checks the log on the pull request the workflow opens |
 | `rotate/rotate_db_login.py` | The rotation steps, one per job, each refusing when it would be unsafe |
-| `rotate/secrets_store.py` | The secrets store: three JSON files a person edits by hand |
+| `rotate/secrets_store.py` | The secrets store: one JSON file, `secrets/api_secrets.json`, a person edits by hand |
 | `rotate/rotation_log.py` | The log's rules, and the append-only check |
 | `rotate/load.py` | Asks the API who it is five times a second and counts failures |
 | `rotations/demo.csv` | The log: one row per rotation, oldest first |
@@ -31,16 +33,16 @@ Both logins work until step 3, so there is never a moment where the API can't lo
 
 | Here | In a real system |
 |---|---|
-| `secrets/`, three JSON files edited by hand | A cloud secrets manager; a person edits the secret in the console |
-| A file's modification time | The secret's version date |
+| `secrets/api_secrets.json`, edited by hand | One secret in a cloud secrets manager, holding the switch and a slot per login among the app's other settings; a person edits it in the console |
 | `postgres:16` container | A managed Postgres |
 | `api_1` and `api_2` behind Caddy | API pods behind a Kubernetes service |
 | `docker compose up -d --force-recreate --wait api_1`, then `api_2` | `kubectl rollout restart` |
 | Environments `demo-gate` and `demo` | `staging-gate`/`staging`, `production-gate`/`production` |
 | The built-in `GITHUB_TOKEN` opens the log's pull request | A GitHub App token, so that the log's check runs on the pull request |
-| 30 seconds of quiet before a password is switched off | Minutes, when a connection proxy keeps idle connections open |
+| Waits 2 minutes for connections to come or go | 5 and 15 minutes |
+| "Rotation complete" on the run page | Also a chat message |
 
-Left out on purpose: anything else that logs in with the password, such as serverless functions or BI tools, and a chat message at the end.
+Left out on purpose: anything else that logs in with the password, such as scheduled jobs (they read the switch afresh on every run) or BI tools.
 
 ## Run it on your machine
 
@@ -49,11 +51,13 @@ You need docker with compose, python3, git and the GitHub CLI `gh`. Your user mu
 ```bash
 cd basic-rotation
 python3 -m venv .venv && .venv/bin/pip install -r rotate/requirements.txt   # psycopg2, for the rotation script
-python3 rotate/secrets_store.py init        # blue gets a password, the switch names blue
+python3 rotate/secrets_store.py init        # the switch names blue; only blue's slot holds a password
 docker compose up -d --build --wait         # database, two replicas, load balancer
 curl -s http://127.0.0.1:8080/whoami        # {"replica": "api_1", "login": "app_blue", ...}
 python3 rotate/load.py                      # leave it running in its own terminal
 ```
+
+`python3 rotate/secrets_store.py show` says at any time which login is active, which is idle, and which slots hold a password, without showing any password.
 
 ### A rotation by hand, without GitHub
 
@@ -61,8 +65,8 @@ The same steps the workflow runs, so you can watch each one refuse or succeed:
 
 ```bash
 PY=.venv/bin/python
-$PY rotate/rotate_db_login.py find-idle                             # the switch names blue, so green is idle
-$PY rotate/rotate_db_login.py set-password                          # refused: green's password predates the switch
+python3 rotate/secrets_store.py show                                # the switch names blue, so green is idle
+$PY rotate/rotate_db_login.py set-password                          # refused: app_green_password is empty
 python3 rotate/secrets_store.py new-password app_green              # the person's job
 $PY rotate/rotate_db_login.py set-password                          # green has its new password; blue is untouched
 $PY rotate/rotate_db_login.py check-switch --new-login app_green    # refused: the switch still names blue
@@ -71,7 +75,9 @@ $PY rotate/rotate_db_login.py check-switch --new-login app_green    # both login
 docker compose up -d --force-recreate --no-deps --wait api_1        # load.py: api_1 now answers as app_green
 docker compose up -d --force-recreate --no-deps --wait api_2
 $PY rotate/rotate_db_login.py check-connections --new-login app_green
-$PY rotate/rotate_db_login.py switch-off --new-login app_green      # once nothing uses blue: PASSWORD NULL
+$PY rotate/rotate_db_login.py switch-off --new-login app_green      # refused: app_blue_password still holds a password
+python3 rotate/secrets_store.py empty app_blue                      # the person's job
+$PY rotate/rotate_db_login.py switch-off --new-login app_green      # once nothing is connected as blue: PASSWORD NULL
 $PY rotate/rotate_db_login.py log --new-login app_green --approved-by you --file rotations/demo.csv
 ```
 
@@ -140,24 +146,23 @@ Don't install it as a service. `./run.sh` in a terminal is enough, and `./config
 
 ## The rotation, with the buttons
 
-Three terminals: the runner's `./run.sh`, `python3 rotate/load.py`, and one for the commands below. A browser on the repository's **Actions** tab.
+Three terminals: the runner's `./run.sh`, `python3 rotate/load.py`, and one for the commands below. A browser on the repository's **Actions** tab. The steps below say green is the idle login; read blue for green and the other way round when `show` says blue is idle.
 
-1. **Actions → Rotate database login → Run workflow**, environment `demo`. The first job runs on your machine and the run page says which login is idle, green the first time, and the command to give it a new password.
-2. Run that command, `python3 rotate/secrets_store.py new-password app_green`, then **approve "the idle login's secret holds its new password"**. The steps below say `app_green`; read `app_blue` when blue is the idle one.
-3. The runner gives green its new password. The run page then says green is ready and asks for the switch.
-4. `python3 rotate/secrets_store.py switch app_green`, then **approve "db_login_active now names the new login"**. The runner checks the switch, restarts `api_1` and then `api_2`, and waits until something connects as green. Watch `load.py`: the login flips, the error count stays at 0.
-5. **Approve "switch off the previous login's password"**. The runner makes sure nothing has used blue for 30 seconds, which is at once if the old replicas are gone, switches its password off, closes any leftover connections, appends the rotation to `rotations/demo.csv` in a new pull request, and says "Rotation complete" on the run page.
-6. Merge the pull request. The log's check runs on main after the merge, and on the pull request itself if `LOG_PR_TOKEN` is set, see below.
+1. `python3 rotate/secrets_store.py show` says which login is idle. Put a new password in its slot, `python3 rotate/secrets_store.py new-password app_green`.
+2. **Actions → Rotate database login → Run workflow**, environment `demo`, then **approve "Approve the rotation"**. The runner gives green its new password, and the run page asks for the switch.
+3. `python3 rotate/secrets_store.py switch app_green`, then **approve "database_user_active now names the new login"**. The runner checks the switch, restarts `api_1` and then `api_2`, and waits until something connects as green. Watch `load.py`: the login flips, the error count stays at 0. The run page asks you to empty blue's slot.
+4. `python3 rotate/secrets_store.py empty app_blue`, then **approve "switch off the previous login's password"**. The runner waits until nothing is connected as blue, which is at once if the old replicas are gone, switches its password off, appends the rotation to `rotations/demo.csv` in a new pull request, and says "Rotation complete" on the run page.
+5. Merge the pull request. The log's check runs on main after the merge, and on the pull request itself if `LOG_PR_TOKEN` is set, see below.
 
-To show a refusal: approve the first gate without running the command. The password job fails with `db login rotation: refused: … put a new one in it first`. Run the command, then **Re-run failed jobs**.
+To show a refusal: start the run without step 1. The password job fails with `db login rotation: refused: app_green_password is empty: put the new password in it first`. Put a new password in the slot, then **Re-run failed jobs**.
 
-To show something still using the old login: before step 5, open `psql` as `app_blue` in a fourth terminal and run `select pg_sleep(60)`. The last job waits until it is done, then carries on.
+To show something still using the old login: before step 4, run `docker compose exec database psql -U app_blue -d demo -c 'select pg_sleep(60)'` in a fourth terminal. The last job waits until it is done, then carries on. If it took longer than 2 minutes, the job would refuse and say where the connection comes from.
 
 Optional, so that the log's check also runs on the pull request the workflow opens: create a fine-grained personal access token for this repository only, with *Contents* and *Pull requests* set to read and write, and save it with `gh secret set LOG_PR_TOKEN -R OWNER/basic-rotation`. GitHub doesn't start workflows on pull requests opened with the built-in token.
 
 ## When a step refuses
 
-It prints `db login rotation: refused:` and the reason, changes nothing unsafe, and the job fails. Fix the reason, then use **Re-run failed jobs** on the run page, never **Re-run all jobs**: that one starts the rotation over, works out the idle login from the switch again, and if you have already flipped the switch it tries a rotation in the other direction and refuses, saying the other login's password predates the switch. If that has happened: flip the switch back to the login the API is still using, give the idle login a fresh password, and start a new run. If the log's pull request couldn't be opened, the rotation itself is done; add the row by hand in a pull request.
+It prints `db login rotation: refused:` and the reason, changes nothing unsafe, and the job fails. Fix the reason, then use **Re-run failed jobs** on the run page, never **Re-run all jobs**: that one starts the rotation over and works out the idle login from the switch again. If you have already flipped the switch, the idle login is now the one the API used before, and the password job refuses, because that login already logs in with the password in its slot. If that has happened, either flip the switch back and start a new run, or carry on by hand with the steps from "A rotation by hand". If the log's pull request couldn't be opened, the rotation itself is done; add the row by hand in a pull request.
 
 ## Clean up
 

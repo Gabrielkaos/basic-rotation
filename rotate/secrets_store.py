@@ -1,20 +1,20 @@
 """The secrets store, standing in for a cloud secrets manager.
 
-It is a folder of JSON files that a person edits by hand, and that the API
-and the rotation only read. Three secrets:
+One secret, `api_secrets`, a JSON file that a person edits by hand and that
+the API and the rotation only read. It holds the switch and a password slot
+for each login:
 
-    db_login_active         {"login": "app_blue"}                    the switch
-    db_login_app_blue       {"username": "app_blue", "password": …}  blue's password
-    db_login_app_green      {"username": "app_green", "password": …} green's password
+    {
+      "database_user_active": "app_blue",     the switch: the login the API uses
+      "app_blue_password": "…",               blue's slot
+      "app_green_password": ""                green's slot, empty until a rotation needs it
+    }
 
-A file's modification time is the secret's "last saved" date; the rotation
-uses it to refuse a password that was saved before the switch last changed,
-because that is the password from the previous rotation.
-
-    python3 rotate/secrets_store.py init                 first time: blue gets a password, the switch names blue
-    python3 rotate/secrets_store.py new-password LOGIN   put a fresh password in LOGIN's secret, without showing it
+    python3 rotate/secrets_store.py init                 first time: the switch names blue, only blue's slot is filled
+    python3 rotate/secrets_store.py new-password LOGIN   put a fresh password in LOGIN's slot, without showing it
     python3 rotate/secrets_store.py switch LOGIN         flip the switch to LOGIN
-    python3 rotate/secrets_store.py show                 what the switch names, and when each secret was saved
+    python3 rotate/secrets_store.py empty LOGIN          empty LOGIN's slot, once the rotation no longer needs it
+    python3 rotate/secrets_store.py show                 what the switch names, and which slots are filled
 
 The folder is SECRETS_DIR, by default `secrets` in the current directory.
 """
@@ -25,21 +25,27 @@ import os
 import secrets
 import string
 import sys
-import time
 
 LOGINS = ("app_blue", "app_green")
-SWITCH_SECRET = "db_login_active"
+SWITCH = "database_user_active"
 SECRETS_DIR = os.environ.get("SECRETS_DIR", "secrets")
+SECRET = os.path.join(SECRETS_DIR, "api_secrets.json")
 PASSWORD_LENGTH = 48
 
 
-def path(name: str) -> str:
-    return os.path.join(SECRETS_DIR, f"{name}.json")
+def slot(login: str) -> str:
+    """The key in api_secrets that holds `login`'s password."""
+    return f"{login}_password"
 
 
-def save(name: str, value: dict) -> None:
+def load() -> dict:
+    with open(SECRET) as file:
+        return json.load(file)
+
+
+def save(value: dict) -> None:
     os.makedirs(SECRETS_DIR, exist_ok=True)
-    with open(path(name), "w") as file:
+    with open(SECRET, "w") as file:
         json.dump(value, file)
         file.write("\n")
 
@@ -51,54 +57,50 @@ def new_password() -> str:
 
 
 def init() -> str:
-    if os.path.exists(path(SWITCH_SECRET)):
-        return f"{SECRETS_DIR} already exists; nothing changed"
-    for login in LOGINS:
-        save(f"db_login_{login}", {"username": login, "password": new_password()})
-    # The switch is saved last, so both passwords count as older than it: the
-    # first rotation then insists on a freshly typed password for the idle login.
-    time.sleep(0.01)
-    save(SWITCH_SECRET, {"login": LOGINS[0]})
-    return (
-        f"created {SECRETS_DIR}: the switch names {LOGINS[0]}, each login has a "
-        "password in its own secret"
-    )
+    if os.path.exists(SECRET):
+        return f"{SECRET} already exists; nothing changed"
+    save({SWITCH: LOGINS[0], slot(LOGINS[0]): new_password(), slot(LOGINS[1]): ""})
+    return f"created {SECRET}: the switch names {LOGINS[0]}, and only its slot holds a password"
 
 
 def set_new_password(login: str) -> str:
-    save(f"db_login_{login}", {"username": login, "password": new_password()})
-    return f"saved a new {PASSWORD_LENGTH}-character password in db_login_{login}"
+    save({**load(), slot(login): new_password()})
+    return f"saved a new {PASSWORD_LENGTH}-character password in {slot(login)}"
 
 
 def switch(login: str) -> str:
-    save(SWITCH_SECRET, {"login": login})
-    return f"{SWITCH_SECRET} now names {login}"
+    save({**load(), SWITCH: login})
+    return f"{SWITCH} now names {login}"
+
+
+def empty(login: str) -> str:
+    value = load()
+    if value.get(SWITCH) == login:
+        return f"{SWITCH} names {login}, so the API needs its password; nothing changed"
+    save({**value, slot(login): ""})
+    return f"emptied {slot(login)}"
 
 
 def show() -> str:
-    lines = []
-    for name in (SWITCH_SECRET, *(f"db_login_{login}" for login in LOGINS)):
-        try:
-            with open(path(name)) as file:
-                value = json.load(file)
-            saved = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path(name))))
-        except FileNotFoundError:
-            lines.append(f"{name}: missing")
-            continue
-        if name == SWITCH_SECRET:
-            lines.append(f"{name}: names {value.get('login')!r}, saved {saved}")
-        else:
-            state = "has a password" if value.get("password") else "has NO password"
-            lines.append(f"{name}: username {value.get('username')!r}, {state}, saved {saved}")
+    try:
+        value = load()
+    except FileNotFoundError:
+        return f"{SECRET} is missing: run init first"
+    active = value.get(SWITCH)
+    lines = [f"{SWITCH}: {active!r}"]
+    for login in LOGINS:
+        state = "holds a password" if value.get(slot(login)) else "is empty"
+        role = "active" if login == active else "idle"
+        lines.append(f"{slot(login)} ({role}): {state}")
     return "\n".join(lines)
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="The demo's secrets store.")
-    parser.add_argument("command", choices=["init", "new-password", "switch", "show"])
+    parser.add_argument("command", choices=["init", "new-password", "switch", "empty", "show"])
     parser.add_argument("login", nargs="?", choices=LOGINS)
     args = parser.parse_args(argv)
-    if args.command in ("new-password", "switch") and not args.login:
+    if args.command in ("new-password", "switch", "empty") and not args.login:
         parser.error(f"{args.command} needs a login: one of {', '.join(LOGINS)}")
     if args.command == "init":
         print(init())
@@ -106,6 +108,8 @@ def main(argv=None) -> int:
         print(set_new_password(args.login))
     elif args.command == "switch":
         print(switch(args.login))
+    elif args.command == "empty":
+        print(empty(args.login))
     else:
         print(show())
     return 0

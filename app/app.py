@@ -30,22 +30,26 @@ DATABASE_NAME = os.environ.get("DATABASE_NAME", "demo")
 PORT = int(os.environ.get("PORT", "8000"))
 
 
-def read_secret(name: str) -> dict:
-    with open(os.path.join(SECRETS_DIR, f"{name}.json")) as file:
-        return json.load(file)
+LOGINS = ("app_blue", "app_green")
 
 
 def credentials():
     """The active login and its password.
 
-    Read the way the real app reads its secrets store: the switch names the
-    login, and that login's own secret holds the password.
+    Read the way the real app reads its secrets store: the switch
+    `database_user_active` in api_secrets names the login, and that login's
+    slot holds the password. An unknown login or an empty slot stops the API
+    from starting, rather than failing on every request.
     """
-    login = read_secret("db_login_active")["login"]
-    secret = read_secret(f"db_login_{login}")
-    if secret.get("username") != login or not secret.get("password"):
-        raise SystemExit(f"{REPLICA}: db_login_{login} must hold username {login!r} and its password")
-    return login, secret["password"]
+    with open(os.path.join(SECRETS_DIR, "api_secrets.json")) as file:
+        secret = json.load(file)
+    login = secret.get("database_user_active")
+    if login not in LOGINS:
+        raise SystemExit(f"{REPLICA}: database_user_active is {login!r}, not one of {', '.join(LOGINS)}")
+    password = secret.get(f"{login}_password")
+    if not password:
+        raise SystemExit(f"{REPLICA}: database_user_active is {login!r} but {login}_password is empty")
+    return login, password
 
 
 def open_pool():
