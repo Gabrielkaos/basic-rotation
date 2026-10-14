@@ -2,22 +2,25 @@
 
     python rotate/rotate_db_login.py STEP [--new-login LOGIN]
 
-Run by .github/workflows/rotate-db-login.yaml, one step per job, each after a
-person has approved it. Every step reads api_secrets the way the API does:
-the switch `database_user_active` names the login the API uses, and each
-login's password is in its own slot, `<login>_password`.
+Run by .github/workflows/rotate-db-login.yaml, one step per job. Every step
+reads api_secrets the way the API does: the switch `database_user_active`
+names the login the API uses, and each login's password is in its own slot,
+`<login>_password`.
 
-- `set-password` gives the idle login, the one the switch doesn't name, the
-  new password a person put in its slot, so the login works before anything
-  switches to it. The active login is left alone, so the running API notices
-  nothing.
+- `find-idle` starts every rotation: it says which login is idle, the one the
+  switch doesn't name, so the run page can tell a person whose slot gets the
+  new password before anything is approved.
+- `set-password` gives that login the new password a person put in its slot,
+  so the login works before anything switches to it. The active login is left
+  alone, so the running API notices nothing.
 - `check-switch` makes sure a person has flipped the switch to that login, and
   that both logins still work, before anything restarts.
-- `check-connections` waits until the restarted API replicas have connected
-  as the new login.
 - `switch-off` switches off the previous login's password, once a person has
   emptied its slot and nothing is connected as it any more.
 - `log` adds the rotation to the log, with who approved it.
+
+After the API restarts, the workflow checks inside each replica which login it
+logs in as, with rotate/check_api_login.py.
 
 Only a hash of a password reaches the database, so a database log that records
 every ALTER statement never sees one, and no password is ever printed.
@@ -54,18 +57,16 @@ ADMIN_DATABASE_URI = os.environ.get(
 # Refuses a placeholder or a hand-typed word; a generated password is longer.
 MIN_PASSWORD_LENGTH = 32
 
-# How long check-connections waits for the restarted replicas to connect, how
-# long switch-off waits for the previous login's last connection to end, and
-# how often each wait looks again. The real system waits 5 and 15 minutes.
-CONNECT_WAIT_SECONDS = 2 * 60
+# How long switch-off waits for the previous login's last connection to end,
+# and how often it looks again. The real system waits 15 minutes.
 SWITCH_OFF_WAIT_SECONDS = 2 * 60
 CHECK_EVERY_SECONDS = 5
 
 # Each step, and the options it needs.
 STEPS = {
-    "set-password": [],
+    "find-idle": [],
+    "set-password": ["new_login"],
     "check-switch": ["new_login"],
-    "check-connections": ["new_login"],
     "switch-off": ["new_login"],
     "log": ["new_login", "approved_by", "file"],
 }
@@ -114,15 +115,20 @@ def idle_login(active: str) -> str:
     return next(login for login in LOGINS if login != active)
 
 
-def set_password(admin, active: str, passwords: dict, logs_in) -> str:
+def set_password(admin, active: str, new_login: str, passwords: dict, logs_in) -> str:
     """Give the idle login the new password from its slot.
 
     `admin` is an autocommit connection as the database admin, `active` the
-    login the switch names, `passwords` each login's slot (None when empty),
-    and `logs_in(login, password)` whether that login connects with that
-    password.
+    login the switch names, `new_login` the login find-idle said was idle when
+    the run started, `passwords` each login's slot (None when empty), and
+    `logs_in(login, password)` whether that login connects with that password.
     """
     idle = idle_login(active)
+    if idle != new_login:
+        raise RotationRefused(
+            f"{SWITCH} names {active} now, so {idle} is idle, not {new_login}: the "
+            "switch changed since this run started; start a new run"
+        )
     new = passwords[idle]
     if not logs_in(active, passwords[active]):
         raise RotationRefused(f"{slot(active)} doesn't hold {active}'s working password")
@@ -163,21 +169,6 @@ def check_switch(active: str, new_login: str, passwords: dict, logs_in) -> str:
             "still on it couldn't reconnect while the API restarts"
         )
     return f"{SWITCH} names {new_login}, and both logins work"
-
-
-def check_connections(admin, new_login: str, sleep=time.sleep) -> str:
-    """Wait until something has connected as `new_login`: the restarted replicas."""
-    _wait_until(
-        lambda: _connections(admin, new_login),
-        CONNECT_WAIT_SECONDS,
-        lambda: f"nothing has connected as {new_login} after {CONNECT_WAIT_SECONDS} seconds",
-        sleep,
-    )
-    previous = idle_login(new_login)
-    return (
-        f"{new_login} has {_connections(admin, new_login)} connection(s); "
-        f"{previous} still has {_connections(admin, previous)}"
-    )
 
 
 def switch_off(admin, active: str, new_login: str, passwords: dict, logs_in, sleep=time.sleep) -> str:
@@ -322,24 +313,21 @@ def _run_url() -> str:
 def _run(args) -> str:
     if args.step == "log":
         return log_rotation(args.file, args.new_login, args.approved_by)
-    if args.step == "check-connections":
-        admin = _admin()
-        try:
-            return check_connections(admin, args.new_login)
-        finally:
-            admin.close()
     active, passwords = read_api_secrets()
+    if args.step == "find-idle":
+        idle = idle_login(active)
+        _hand_on("idle_login", idle)
+        _hand_on("idle_slot", slot(idle))
+        return f"{SWITCH} names {active}, so {idle} is idle: its new password goes in {slot(idle)}"
     if args.step == "check-switch":
         return check_switch(active, args.new_login, passwords, _logs_in)
     admin = _admin()
     try:
         if args.step == "switch-off":
             return switch_off(admin, active, args.new_login, passwords, _logs_in)
-        outcome = set_password(admin, active, passwords, _logs_in)
+        return set_password(admin, active, args.new_login, passwords, _logs_in)
     finally:
         admin.close()
-    _hand_on("new_login", idle_login(active))
-    return outcome
 
 
 def main(argv=None) -> int:
@@ -348,7 +336,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--new-login",
         choices=LOGINS,
-        help="for the steps after set-password: the login set-password prepared",
+        help="for the steps after find-idle: the login find-idle said was idle",
     )
     parser.add_argument("--approved-by", help="who approved the run, GitHub logins separated by ';'")
     parser.add_argument("--file", help="for log: the rotation log")
