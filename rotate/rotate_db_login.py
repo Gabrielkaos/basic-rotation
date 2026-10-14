@@ -318,6 +318,7 @@ def _run(args) -> str:
         idle = idle_login(active)
         _hand_on("idle_login", idle)
         _hand_on("idle_slot", slot(idle))
+        _hand_on("active_slot", slot(active))
         return f"{SWITCH} names {active}, so {idle} is idle: its new password goes in {slot(idle)}"
     if args.step == "check-switch":
         return check_switch(active, args.new_login, passwords, _logs_in)

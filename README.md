@@ -150,11 +150,13 @@ Don't install it as a service. `./run.sh` in a terminal is enough, and `./config
 
 Three terminals: the runner's `./run.sh`, `python3 rotate/load.py`, and one for the commands below. A browser on the repository's **Actions** tab. The steps below say green is the idle login; read blue for green and the other way round when `show` says blue is idle.
 
-1. **Actions → Rotate database login → Run workflow**, environment `demo`. The first job runs on your machine, and the run page says which login is idle, green the first time, and the command that puts a new password in its slot.
-2. Run that command, `python3 rotate/secrets_store.py new-password app_green`, then **approve "the idle login's slot holds its new password"**. The runner gives green its new password, and the run page asks for the switch.
-3. `python3 rotate/secrets_store.py switch app_green`, then **approve "database_user_active now names the new login"**. The runner checks the switch, restarts `api_1` and then `api_2`, and checks inside each one that it logs in as green. Watch `load.py`: the login flips, the error count stays at 0. The run page asks you to empty blue's slot.
-4. `python3 rotate/secrets_store.py empty app_blue`, then **approve "switch off the previous login's password"**. The runner waits until nothing is connected as blue, which is at once if the old replicas are gone, switches its password off, appends the rotation to `rotations/demo.csv` in a new pull request, and says "Rotation complete" on the run page.
-5. Merge the pull request. The log's check runs on main after the merge, and on the pull request itself if `LOG_PR_TOKEN` is set, see below.
+Two places on the run page tell you what to do. At the bottom, each job adds a summary, numbered **Step 1**, **Step 2**, **Step 3**, then **Done**; GitHub puts the newest one last, so act on the highest number. At the top, the gate that is waiting for **Review deployments** is named after what must be done before you approve it, for example "Gate 2: switch to app_green".
+
+1. **Actions → Rotate database login → Run workflow**, environment `demo`. The first job runs on your machine, and **Step 1** says which login is idle, green the first time, and the command that puts a new password in its slot.
+2. Run that command, `python3 rotate/secrets_store.py new-password app_green`, then approve **"Gate 1: new password in app_green_password"**. The runner gives green its new password, and **Step 2** asks for the switch.
+3. `python3 rotate/secrets_store.py switch app_green`, then approve **"Gate 2: switch to app_green"**. The runner checks the switch, restarts `api_1` and then `api_2`, and checks inside each one that it logs in as green. Watch `load.py`: the login flips, the error count stays at 0. **Step 3** asks you to empty blue's slot.
+4. `python3 rotate/secrets_store.py empty app_blue`, then approve **"Gate 3: empty app_blue_password"**. The runner waits until nothing is connected as blue, which is at once if the old replicas are gone, switches its password off, appends the rotation to `rotations/demo.csv` in a new pull request, and the last summary says **"Done: rotation complete"**.
+5. Merge the pull request. That's the last step: the log's check, "Check rotation log", runs by itself after the merge, and on the pull request itself if `LOG_PR_TOKEN` is set, see below. You only need to look at it if the pull request shows a red ✗.
 
 To show a refusal: approve the first gate without running the command. The password job fails with `db login rotation: refused: app_green_password is empty: put the new password in it first`. Put a new password in the slot, then **Re-run failed jobs**.
 

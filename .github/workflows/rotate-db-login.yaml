@@ -38,6 +38,7 @@ jobs:
     outputs:
       idle_login: ${{ steps.find.outputs.idle_login }}
       idle_slot: ${{ steps.find.outputs.idle_slot }}
+      active_slot: ${{ steps.find.outputs.active_slot }}
     steps:
       - name: Check the runner can see the project
         run: |
@@ -50,14 +51,15 @@ jobs:
           "$PYTHON" rotate/rotate_db_login.py find-idle
       - name: Say what to do first
         run: |
-          echo "### ${IDLE_LOGIN} is the idle login on ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "In api_secrets, put a new password in ${IDLE_SLOT}, \`python3 rotate/secrets_store.py new-password ${IDLE_LOGIN}\`, and change nothing else. Then approve the next step." >> "$GITHUB_STEP_SUMMARY"
+          echo "### Step 1: put a new password in ${IDLE_SLOT}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${IDLE_LOGIN} is the idle login on ${{ inputs.environment }}. Run \`python3 rotate/secrets_store.py new-password ${IDLE_LOGIN}\` and change nothing else. Then approve Gate 1." >> "$GITHUB_STEP_SUMMARY"
         env:
           IDLE_LOGIN: ${{ steps.find.outputs.idle_login }}
           IDLE_SLOT: ${{ steps.find.outputs.idle_slot }}
 
   approve:
-    name: "Approve: the idle login's slot holds its new password"
+    # The name shows next to "Review deployments": what must be done first.
+    name: "Gate 1: new password in ${{ needs.find_idle_login.outputs.idle_slot }}"
     needs: find_idle_login
     runs-on: ubuntu-latest
     environment:
@@ -82,11 +84,11 @@ jobs:
           "$PYTHON" rotate/rotate_db_login.py set-password --new-login "$NEW_LOGIN"
       - name: Say what to do next
         run: |
-          echo "### ${NEW_LOGIN} is ready on ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Set database_user_active in api_secrets to ${NEW_LOGIN}, \`python3 rotate/secrets_store.py switch ${NEW_LOGIN}\`, then approve the next step." >> "$GITHUB_STEP_SUMMARY"
+          echo "### Step 2: flip the switch to ${NEW_LOGIN}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${NEW_LOGIN} has its new password. Run \`python3 rotate/secrets_store.py switch ${NEW_LOGIN}\`, then approve Gate 2." >> "$GITHUB_STEP_SUMMARY"
 
   approve_switch:
-    name: "Approve: database_user_active now names the new login"
+    name: "Gate 2: switch to ${{ needs.find_idle_login.outputs.idle_login }}"
     needs: [find_idle_login, set_new_password]
     runs-on: ubuntu-latest
     environment:
@@ -127,12 +129,14 @@ jobs:
           done
       - name: Say what to do next
         run: |
-          PREVIOUS=$([ "$NEW_LOGIN" = app_blue ] && echo app_green || echo app_blue)
-          echo "### The ${{ inputs.environment }} API now uses ${NEW_LOGIN}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Empty ${PREVIOUS}'s slot, \`python3 rotate/secrets_store.py empty ${PREVIOUS}\`, then approve the last step to switch off its password. Until then you can still go back: flip the switch back and restart." >> "$GITHUB_STEP_SUMMARY"
+          PREVIOUS=${PREVIOUS_SLOT%_password}
+          echo "### Step 3: empty ${PREVIOUS_SLOT}" >> "$GITHUB_STEP_SUMMARY"
+          echo "The ${{ inputs.environment }} API now uses ${NEW_LOGIN}. Run \`python3 rotate/secrets_store.py empty ${PREVIOUS}\`, then approve Gate 3 to switch off ${PREVIOUS}'s password. Until then you can still go back: flip the switch back and restart." >> "$GITHUB_STEP_SUMMARY"
+        env:
+          PREVIOUS_SLOT: ${{ needs.find_idle_login.outputs.active_slot }}
 
   approve_switch_off:
-    name: "Approve: switch off the previous login's password"
+    name: "Gate 3: empty ${{ needs.find_idle_login.outputs.active_slot }}"
     needs: [find_idle_login, switch_over]
     runs-on: ubuntu-latest
     environment:
@@ -183,7 +187,7 @@ jobs:
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
       - name: Say the rotation is complete
         run: |
-          echo "### Rotation complete on ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Done: rotation complete on ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
           echo "${NEW_LOGIN} is the active login, and the previous login's password is switched off. Approved by ${APPROVED_BY}." >> "$GITHUB_STEP_SUMMARY"
           echo "Merge the log's pull request to keep the record: ${LOG_PR}" >> "$GITHUB_STEP_SUMMARY"
         env:
